@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/h-manifest.conf"
 LOG_FILE="${CUSTOM_LOG_BASENAME}.log"
 VERSION_VALUE="${CUSTOM_VERSION:-}"
 ALGO_VALUE="${CUSTOM_ALGO:-}"
-GPU_STATS_FILE=/run/hive/gpu-stats.json
+BIN_PATH="$SCRIPT_DIR/ama-miner"
 
 json_escape() {
   local str=${1-}
@@ -37,19 +37,89 @@ array_to_json_numbers() {
   fi
 }
 
+should_skip_bus_id() {
+  local id=${1,,}
+  if [[ $id =~ ^([0-9a-f]{4}|[0-9a-f]{8}):([0-9a-f]{2}):([0-9a-f]{2})\.([0-7])$ ]]; then
+    local bus=${BASH_REMATCH[2]}
+    local func=${BASH_REMATCH[4]}
+    if [[ $bus == "00" ]] && [[ $func == "0" ]]; then
+      return 0
+    fi
+  elif [[ $id =~ ^([0-9a-f]{2}):([0-9a-f]{1,2})\.([0-7])$ ]]; then
+    local bus=${BASH_REMATCH[1]}
+    local func=${BASH_REMATCH[3]}
+    if [[ $bus == "00" ]] && [[ $func == "0" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+get_proc_uptime() {
+  if [[ ! -x $BIN_PATH ]]; then
+    return 1
+  fi
+  if ! command -v pgrep >/dev/null 2>&1; then
+    return 1
+  fi
+
+  mapfile -t pids < <(pgrep -f "$BIN_PATH" 2>/dev/null || true)
+  for pid in "${pids[@]}"; do
+    [[ -z $pid ]] && continue
+    etimes=$(ps -p "$pid" -o etimes= 2>/dev/null | awk 'NR==1 { gsub(/^[ \t]+/, ""); print }')
+    if [[ $etimes =~ ^[0-9]+$ ]]; then
+      echo "$etimes"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 declare -a temp_arr fan_arr busids_hex bus_arr
-if command -v jq >/dev/null 2>&1 && [[ -f $GPU_STATS_FILE ]]; then
-  mapfile -t temp_arr   < <(jq -r '.temp[]? | tonumber' "$GPU_STATS_FILE")
-  mapfile -t fan_arr    < <(jq -r '.fan[]? | tonumber' "$GPU_STATS_FILE")
-  mapfile -t busids_hex < <(jq -r '.busids[]?' "$GPU_STATS_FILE")
+declare -A skip_idx
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  while IFS=, read -r idx temp fan busid; do
+    idx=${idx//[[:space:]]/}
+    [[ -z $idx ]] && continue
+
+    temp=${temp//[[:space:]]/}
+    if [[ ! $temp =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+      temp=0
+    fi
+    temp=${temp%%.*}
+
+    fan=${fan//[[:space:]]/}
+    if [[ ! $fan =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+      fan=0
+    fi
+    fan=${fan%%.*}
+
+    busid=${busid//[[:space:]]/}
+    [[ -z $busid ]] && busid="0000:00:00.0"
+
+    temp_arr[idx]=$temp
+    fan_arr[idx]=$fan
+    busids_hex[idx]=${busid,,}
+  done < <(nvidia-smi --query-gpu=index,temperature.gpu,fan.speed,pci.bus_id --format=csv,noheader,nounits 2>/dev/null || true)
 fi
 
-for id in "${busids_hex[@]}"; do
+for idx in "${!busids_hex[@]}"; do
+  id=${busids_hex[idx]}
+  if should_skip_bus_id "$id"; then
+    skip_idx[$idx]=1
+  fi
   bus_part=${id%%:*}
+  if [[ $id =~ ^([0-9a-fA-F]{4}|[0-9a-fA-F]{8}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.[0-7]$ ]]; then
+    bus_part=${BASH_REMATCH[2]}
+  elif [[ $id =~ ^([0-9a-fA-F]{2}):([0-9a-fA-F]{1,2})\.[0-7]$ ]]; then
+    bus_part=${BASH_REMATCH[1]}
+  fi
   if [[ $bus_part =~ ^[0-9a-fA-F]+$ ]]; then
-    bus_arr+=( $((16#$bus_part)) )
+    bus_arr[$idx]=$((16#$bus_part))
   else
-    bus_arr+=(0)
+    bus_arr[$idx]=0
   fi
 done
 
@@ -75,32 +145,43 @@ for idx in "${!hs_map[@]}"; do
 done
 
 declare -a hs_arr temp_out fan_out bus_out
-have_temp=false
-have_fan=false
-have_bus=false
+have_temp_orig=false
+have_fan_orig=false
+have_bus_orig=false
 
-(( ${#temp_arr[@]} > 0 )) && have_temp=true
-(( ${#fan_arr[@]}  > 0 )) && have_fan=true
-(( ${#bus_arr[@]}  > 0 )) && have_bus=true
+(( ${#temp_arr[@]} > 0 )) && have_temp_orig=true
+(( ${#fan_arr[@]}  > 0 )) && have_fan_orig=true
+(( ${#bus_arr[@]}  > 0 )) && have_bus_orig=true
 
 for ((i=0; i<gpu_count; i++)); do
+  if [[ -n ${skip_idx[$i]:-} ]]; then
+    continue
+  fi
   raw=${hs_map[$i]:-0}
   if [[ $raw == 0 ]]; then
     kh=0
   else
     kh=$(awk -v v="$raw" 'BEGIN { printf "%.3f", v/1000 }')
   fi
-  hs_arr[i]=$kh
-  if $have_temp; then
-    temp_out[i]=${temp_arr[i]:-0}
+  hs_arr+=("$kh")
+  if $have_temp_orig; then
+    temp_out+=("${temp_arr[i]:-0}")
   fi
-  if $have_fan; then
-    fan_out[i]=${fan_arr[i]:-0}
+  if $have_fan_orig; then
+    fan_out+=("${fan_arr[i]:-0}")
   fi
-  if $have_bus; then
-    bus_out[i]=${bus_arr[i]:-0}
+  if $have_bus_orig; then
+    bus_out+=("${bus_arr[i]:-0}")
   fi
 done
+
+have_temp=false
+have_fan=false
+have_bus=false
+
+(( ${#temp_out[@]} > 0 )) && have_temp=true
+(( ${#fan_out[@]}  > 0 )) && have_fan=true
+(( ${#bus_out[@]}  > 0 )) && have_bus=true
 
 if ! $have_temp; then
   temp_out=()
@@ -118,7 +199,9 @@ else
   sum_khs=0
 fi
 
-if [[ -f $LOG_FILE ]]; then
+if uptime=$(get_proc_uptime); then
+  :
+elif [[ -f $LOG_FILE ]]; then
   now=$(date +%s)
   file_mtime=$(stat -c %Y "$LOG_FILE" 2>/dev/null || echo 0)
   (( uptime = now - file_mtime ))
