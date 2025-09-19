@@ -10,6 +10,9 @@ LOG_FILE="${CUSTOM_LOG_BASENAME}.log"
 VERSION_VALUE="${CUSTOM_VERSION:-}"
 ALGO_VALUE="${CUSTOM_ALGO:-}"
 BIN_PATH="$SCRIPT_DIR/ama-miner"
+IGNORE_PCI_BUS_00=${IGNORE_PCI_BUS_00:-1}
+LAST_STATS_FILE=/run/hive/last_stat.json
+SHARE_STATE_FILE=/run/hive/amaminer_share.state
 
 json_escape() {
   local str=${1-}
@@ -76,7 +79,43 @@ get_proc_uptime() {
   return 1
 }
 
+get_previous_accepted() {
+  local prev=0
+  if [[ -f $LAST_STATS_FILE ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      prev=$(jq -r 'try .params.miner_stats.ar[0] catch 0' "$LAST_STATS_FILE" 2>/dev/null || echo 0)
+    elif command -v python3 >/dev/null 2>&1; then
+      prev=$(python3 - "$LAST_STATS_FILE" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as fh:
+        data = json.load(fh)
+    val = data.get('params', {}).get('miner_stats', {}).get('ar', [0, 0])
+    if isinstance(val, (list, tuple)) and val:
+        v = val[0]
+        if isinstance(v, (int, float)):
+            print(int(v))
+        else:
+            print(0)
+    else:
+        print(0)
+except Exception:
+    print(0)
+PY
+      )
+    else
+      prev=$(grep -o '"ar"\s*:\s*\[[0-9]\+' "$LAST_STATS_FILE" 2>/dev/null | head -n1 | grep -o '[0-9]\+' || printf '0')
+    fi
+  fi
+  [[ $prev =~ ^[0-9]+$ ]] || prev=0
+  echo "$prev"
+}
+
 declare -a temp_arr fan_arr busids_hex bus_arr
+temp_arr=()
+fan_arr=()
+busids_hex=()
+bus_arr=()
 declare -A skip_idx
 
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -105,9 +144,10 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   done < <(nvidia-smi --query-gpu=index,temperature.gpu,fan.speed,pci.bus_id --format=csv,noheader,nounits 2>/dev/null || true)
 fi
 
+all_bus_zero=true
 for idx in "${!busids_hex[@]}"; do
   id=${busids_hex[idx]}
-  if should_skip_bus_id "$id"; then
+  if (( IGNORE_PCI_BUS_00 != 0 )) && should_skip_bus_id "$id"; then
     skip_idx[$idx]=1
   fi
   bus_part=${id%%:*}
@@ -118,10 +158,67 @@ for idx in "${!busids_hex[@]}"; do
   fi
   if [[ $bus_part =~ ^[0-9a-fA-F]+$ ]]; then
     bus_arr[$idx]=$((16#$bus_part))
+    if (( bus_arr[$idx] != 0 )); then
+      all_bus_zero=false
+    fi
   else
     bus_arr[$idx]=0
   fi
 done
+
+if $all_bus_zero; then
+  skip_idx=()
+fi
+
+share_prev_inode=0
+share_prev_count=0
+share_prev_total=0
+if [[ -f $SHARE_STATE_FILE ]]; then
+  read -r share_prev_inode share_prev_count share_prev_total < "$SHARE_STATE_FILE" || true
+fi
+[[ $share_prev_inode =~ ^[0-9]+$ ]] || share_prev_inode=0
+[[ $share_prev_count =~ ^[0-9]+$ ]] || share_prev_count=0
+[[ $share_prev_total =~ ^[0-9]+$ ]] || share_prev_total=0
+
+log_inode=0
+if [[ -f $LOG_FILE ]]; then
+  log_inode=$(stat -c %i "$LOG_FILE" 2>/dev/null || echo 0)
+fi
+[[ $log_inode =~ ^[0-9]+$ ]] || log_inode=0
+
+share_count_current=0
+if [[ -f $LOG_FILE ]]; then
+  if command -v rg >/dev/null 2>&1; then
+    share_count_current=$(rg --count --no-filename --fixed-strings 'Solution accepted!' "$LOG_FILE" 2>/dev/null || printf '0')
+  else
+    share_count_current=$(grep -c 'Solution accepted!' "$LOG_FILE" 2>/dev/null || printf '0')
+  fi
+fi
+share_count_current=${share_count_current//$'\r'/}
+share_count_current=${share_count_current//$'\n'/}
+[[ $share_count_current =~ ^[0-9]+$ ]] || share_count_current=0
+
+new_shares=0
+reset_shares=false
+if [[ $share_prev_inode != "$log_inode" ]] || (( share_count_current < share_prev_count )); then
+  reset_shares=true
+else
+  new_shares=$(( share_count_current - share_prev_count ))
+fi
+(( new_shares < 0 )) && new_shares=0
+
+accepted_prev=0
+if ! $reset_shares; then
+  accepted_prev=$(get_previous_accepted)
+  if (( share_prev_total > accepted_prev )); then
+    accepted_prev=$share_prev_total
+  fi
+fi
+
+accepted_total=$(( accepted_prev + new_shares ))
+(( accepted_total < 0 )) && accepted_total=0
+
+printf '%s %s %s\n' "$log_inode" "$share_count_current" "$accepted_total" > "$SHARE_STATE_FILE" 2>/dev/null || true
 
 declare -A seen_idx hs_map
 if [[ -f $LOG_FILE ]]; then
@@ -145,6 +242,10 @@ for idx in "${!hs_map[@]}"; do
 done
 
 declare -a hs_arr temp_out fan_out bus_out
+hs_arr=()
+temp_out=()
+fan_out=()
+bus_out=()
 have_temp_orig=false
 have_fan_orig=false
 have_bus_orig=false
@@ -225,6 +326,7 @@ if command -v jq >/dev/null 2>&1; then
     --arg algo "$ALGO_VALUE" \
     --argjson bus "$bus_json" \
     --arg total "$sum_khs" \
+    --arg accepted "$accepted_total" \
     '{
       hs: $hs,
       hs_units: "khs",
@@ -232,14 +334,14 @@ if command -v jq >/dev/null 2>&1; then
       fan: $fan,
       uptime: $uptime,
       ver: $ver,
-      ar: [0, 0],
+      ar: [($accepted | tonumber), 0],
       bus_numbers: $bus,
       total_khs: ($total | tonumber)
     } | if $algo == "" then . else . + {algo: $algo} end'
   )
 else
   ver_json=$(json_escape "$VERSION_VALUE")
-  stats="{\"hs\":$hs_json,\"hs_units\":\"khs\",\"temp\":$temp_json,\"fan\":$fan_json,\"uptime\":$uptime,\"ver\":\"$ver_json\",\"ar\":[0,0],\"bus_numbers\":$bus_json,\"total_khs\":$sum_khs"
+  stats="{\"hs\":$hs_json,\"hs_units\":\"khs\",\"temp\":$temp_json,\"fan\":$fan_json,\"uptime\":$uptime,\"ver\":\"$ver_json\",\"ar\":[${accepted_total},0],\"bus_numbers\":$bus_json,\"total_khs\":$sum_khs"
   if [[ -n $ALGO_VALUE ]]; then
     algo_json=$(json_escape "$ALGO_VALUE")
     stats+=",\"algo\":\"$algo_json\"}"
@@ -249,7 +351,7 @@ else
 fi
 
 [[ -z $sum_khs ]] && sum_khs=0
-[[ -z $stats ]] && stats='{"hs":[],"hs_units":"khs","temp":[],"fan":[],"uptime":0,"ver":"","ar":[0,0],"total_khs":0}'
+[[ -z $stats ]] && stats='{"hs":[],"hs_units":"khs","temp":[],"fan":[],"uptime":0,"ver":"","ar":[${accepted_total},0],"total_khs":0}'
 
 echo "$sum_khs"
 echo "$stats"
