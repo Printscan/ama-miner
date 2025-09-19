@@ -47,6 +47,7 @@ primary_pool="${primary_pool#http://}"
 primary_pool="${primary_pool#https://}"
 
 extra_args="${CUSTOM_USER_CONFIG:-}"
+extra_programs=()
 
 if [[ -n "$extra_args" ]]; then
   if [[ "$extra_args" =~ (^|[[:space:]])--host([=[:space:]]|$) ]]; then
@@ -58,6 +59,35 @@ if [[ -n "$extra_args" ]]; then
   if [[ "$extra_args" =~ (^|[[:space:]])--pass([=[:space:]]|$) ]]; then
     pass=""
   fi
+
+  eval "set -- $extra_args"
+  remaining=()
+  while (($#)); do
+    token=$1
+    shift
+    case $token in
+      RUN=*|run=*)
+        value=${token#*=}
+        value=${value%%[[:space:]]*}
+        [[ -n "$value" ]] && extra_programs+=("$value")
+        ;;
+      RUN:*|run:*)
+        value=${token#*:}
+        value=${value%%[[:space:]]*}
+        [[ -n "$value" ]] && extra_programs+=("$value")
+        ;;
+      *)
+        remaining+=("$token")
+        ;;
+    esac
+  done
+  extra_args="${remaining[*]:-}"
+fi
+
+if ((${#extra_programs[@]})); then
+  extra_programs_serialized=$(printf '%s\n' "${extra_programs[@]}")
+else
+  extra_programs_serialized=""
 fi
 
 mkdir -p "$(dirname "$CUSTOM_CONFIG_FILENAME")"
@@ -66,6 +96,7 @@ HOST=$(printf '%q' "$primary_pool")
 USER=$(printf '%q' "$user")
 PASS=$(printf '%q' "$pass")
 EXTRA_ARGS=$(printf '%q' "$extra_args")
+EXTRA_PROGRAMS=$(printf '%q' "$extra_programs_serialized")
 CFG
 
 chmod 600 "$CUSTOM_CONFIG_FILENAME"
