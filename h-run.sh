@@ -20,6 +20,68 @@ host="${HOST:-}"
 user="${USER:-}"
 pass="${PASS:-}"
 extra_args="${EXTRA_ARGS:-}"
+extra_programs_raw="${EXTRA_PROGRAMS:-}"
+
+trim_whitespace() {
+  local text="$1"
+  text="${text#${text%%[!$'\t\n ']*}}"
+  text="${text%${text##*[!$'\t\n ']}}"
+  printf '%s' "$text"
+}
+
+extra_programs=()
+if [[ -n "$extra_programs_raw" ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    line=$(trim_whitespace "$line")
+    [[ -z "$line" ]] && continue
+    extra_programs+=("$line")
+  done <<< "$(printf '%s\n' "$extra_programs_raw")"
+fi
+
+extra_program_pids=()
+
+cleanup() {
+  if ((${#extra_program_pids[@]})); then
+    for pid in "${extra_program_pids[@]}"; do
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        kill "$pid" >/dev/null 2>&1 || true
+        wait "$pid" 2>/dev/null || true
+      fi
+    done
+  fi
+}
+
+trap cleanup EXIT
+
+start_additional_program() {
+  local program_path="$1"
+
+  if [[ -z "$program_path" ]]; then
+    return
+  fi
+
+  if [[ ! -e "$program_path" ]]; then
+    echo "WARNING: additional program not found: $program_path" >&2
+    return
+  fi
+
+  if [[ -d "$program_path" ]]; then
+    echo "WARNING: additional program path is a directory: $program_path" >&2
+    return
+  fi
+
+  if [[ ! -x "$program_path" ]]; then
+    if ! chmod +x "$program_path" 2>/dev/null; then
+      echo "WARNING: unable to make additional program executable: $program_path" >&2
+      return
+    fi
+  fi
+
+  echo "Starting additional program: $program_path"
+  "$program_path" &
+  extra_program_pids+=($!)
+}
 
 nvtool_opts=()
 nvtool_vals=()
@@ -135,6 +197,12 @@ fi
 
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
+
+if ((${#extra_programs[@]})); then
+  for program in "${extra_programs[@]}"; do
+    start_additional_program "$program"
+  done
+fi
 
 cmd=("$BIN_PATH")
 [[ -n "$host" ]] && cmd+=(--host "$host")
